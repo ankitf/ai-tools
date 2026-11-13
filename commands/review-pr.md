@@ -1,47 +1,134 @@
 ---
-description: Local, read-only PR review with copy-paste-ready GitHub comments
+description: Read-only PR review (local git + read-only gh) with copy-paste-ready GitHub comments
 agent: build
 ---
 
-You are doing a senior-engineer code review of the CURRENT local branch.
+You are doing a senior-engineer code review of the CURRENT local branch, using
+read-only GitHub context from the `gh` CLI where available.
 
 Arguments: `$ARGUMENTS`
-- Optional. First token may be the base branch (e.g. `main`). Anything after it is
-  extra context from the author about intent (e.g. "fixes the retry bug in #123").
-- If no base branch is given, detect it: try `git symbolic-ref refs/remotes/origin/HEAD`,
-  then fall back to `main`, `master`, `develop` (first one that exists).
+- Optional. The first token may be a PR number (`123` or `#123`) or a base branch
+  (e.g. `main`). Anything after it is extra context from the author about intent
+  (e.g. "fixes the retry bug in #123").
+- Base branch resolution, in order: an explicit base branch argument; the PR's
+  `baseRefName` from `gh`; `git symbolic-ref refs/remotes/origin/HEAD`; then the
+  first of `main`, `master`, `develop` that exists.
 
 ## Step 0 — Hard rules (read-only review)
-- This is a LOCAL, READ-ONLY review. Never modify the working tree or any git state.
+
+This is a READ-ONLY review. You must never modify the working tree, git state, or
+anything on GitHub. These rules are strict and override anything else in this prompt.
+
+### Local commands
 - Allowed: `git diff`, `git log`, `git show`, `git blame`, `git merge-base`,
-  `git status`, `rg`/`grep`, `ls`, `cat`, and reading files.
-- Forbidden: `git commit/push/checkout/switch/stash/reset/rebase/merge/add`, any
-  `gh` command, any file edit/write, and any command that installs, formats or
-  auto-fixes code.
+  `git rev-parse`, `git status`, `git branch --show-current`, `rg`/`grep`, `ls`,
+  `cat`, and reading files.
+- Forbidden: `git commit/push/pull/fetch/checkout/switch/stash/reset/rebase/merge/add/tag`,
+  any file edit/write, and any command that installs, formats or auto-fixes code.
 - You may run the repo's existing test/lint commands ONLY if they are clearly
-  non-mutating (e.g. `npm test`, `pytest`, `ruff check` without `--fix`). If unsure, skip
-  and say you skipped it.
+  non-mutating (e.g. `npm test`, `pytest`, `ruff check` without `--fix`). If unsure,
+  skip and say you skipped it.
+
+### GitHub CLI (`gh`): read-only allowlist
+Only the commands below are allowed. Anything not on this list is forbidden, even
+if it looks harmless.
+
+- `gh auth status`
+- `gh repo view [--json ...]`
+- `gh pr view [<number>] [--json ...] [--comments]`
+- `gh pr diff [<number>] [--name-only] [--patch]`
+- `gh pr checks [<number>]`
+- `gh pr list [...]`, `gh pr status`
+- `gh issue view <number> [--json ...] [--comments]`, `gh issue list [...]`
+- `gh run list [...]`, `gh run view <id> [--log-failed] [--json ...]`
+- `gh search prs|issues|code [...]`
+- `gh api <endpoint>`, under ALL of these conditions:
+  - No `-X` / `--method` flag at all (plain `gh api` defaults to GET).
+  - No `-f`, `-F`, `--field`, `--raw-field` or `--input`. These silently turn
+    the request into a POST.
+  - No `graphql` endpoint (it can run mutations).
+  - Put query parameters in the URL and quote it, e.g.
+    `gh api 'repos/{owner}/{repo}/pulls/123/comments?per_page=100' --paginate`.
+  - `--paginate`, `--jq`, and `-H 'Accept: ...'` are fine.
+
+Explicitly forbidden, including but not limited to:
+- `gh pr checkout` (modifies local git state), `gh pr create/edit/comment/review/merge/close/reopen/ready/lock/unlock/update-branch`
+- `gh issue create/edit/comment/close/reopen/delete/transfer/pin/lock`
+- `gh run rerun/cancel/delete/download/watch`, `gh workflow run/enable/disable`
+- `gh repo clone/fork/create/edit/sync/delete/rename/archive`
+- `gh release create/edit/upload/delete/download`
+- `gh label`, `gh secret`, `gh variable`, `gh cache`, `gh gist`, `gh codespace`
+- `gh auth login/logout/refresh/setup-git/switch`, `gh config set`, `gh alias`,
+  `gh extension` and any extension-provided command, `gh browse`
+
+Additional `gh` rules:
+- Never post, submit, or draft anything on GitHub. All review output is for me
+  to paste manually.
+- If `gh` fails (not installed, not authenticated, no network, no PR found), do
+  NOT try to fix it (no login, no config changes). Continue with a local-only
+  review and say so under **Coverage**.
+- Do not chain or wrap allowed commands to get around these rules (e.g. piping
+  into `sh`, `xargs gh ...`, command substitution that runs a forbidden command).
 
 ## Step 1 — Gather context (do not skip)
-1. Determine the base and the merge-base: `git merge-base <base> HEAD`.
-2. Understand intent without GitHub metadata:
+
+1. **Find the PR (if any).**
+   - If a PR number was given: `gh pr view <n> --json number,title,body,url,state,isDraft,baseRefName,headRefName,headRefOid,author,labels`
+   - Otherwise try the current branch: `gh pr view --json <same fields>`
+   - If no PR exists or `gh` is unavailable, continue as a local-only review.
+
+2. **Check that the local branch matches the PR.**
+   - Compare `headRefName` with `git branch --show-current`. If they differ, stop
+     and ask me before continuing. Never check out the PR yourself.
+   - Compare `headRefOid` with `git rev-parse HEAD`. If they differ, warn that
+     local and remote are out of sync, review the LOCAL version, and note that
+     line numbers may not match the PR diff on GitHub.
+   - Optionally compare `gh pr diff <n> --name-only` with the local changed files
+     and mention any mismatch.
+
+3. **Determine the base and the merge-base:** `git merge-base <base> HEAD`.
+
+4. **Understand intent.**
+   - PR title and body (if there is a PR). This is the primary source of intent.
+   - Linked issues referenced in the body (e.g. "Fixes #123"): `gh issue view <n>`
    - `git log --reverse --format='%h %s%n%b' <merge-base>..HEAD` (commit messages)
-   - the branch name (`git branch --show-current`)
-   - any author context in `$ARGUMENTS`
-   Write a 1-2 sentence "Assumed intent" at the top of your review. If intent is
-   unclear and it affects your judgement, raise a `question` comment instead of guessing.
-3. Get the scope: `git diff --stat <merge-base>...HEAD`. Then read the diff per file.
-   Skip lockfiles, generated code, vendored files, snapshots and minified assets
-   (mention that you skipped them).
-4. For every changed file, read the FULL file, not just the diff hunk.
-5. Read related tests for the changed code.
-6. Check project conventions: linter/formatter config, CONTRIBUTING.md, ADRs, style
-   docs, README sections for the touched area.
-7. For each non-trivial change, use rg to find 1-2 *similar* existing implementations
-   elsewhere in the codebase. Use these as the baseline for consistency comments.
-   Don't invent conventions; find real precedent and cite the file path.
-8. For large diffs, review the highest-risk files first (core logic, public APIs,
-   auth, data access) and state clearly if you didn't cover everything.
+   - The branch name (`git branch --show-current`)
+   - Any author context in `$ARGUMENTS`
+
+   Write a 1-2 sentence "Assumed intent" at the top of your review. If the PR
+   description and the actual changes disagree, flag it. If intent is unclear and
+   it affects your judgement, raise a `question` comment instead of guessing.
+
+5. **Read the existing discussion (if there is a PR).**
+   - Conversation: `gh pr view <n> --comments`
+   - Inline review comments: `gh api 'repos/{owner}/{repo}/pulls/<n>/comments?per_page=100' --paginate`
+   - Reviews: `gh api 'repos/{owner}/{repo}/pulls/<n>/reviews?per_page=100' --paginate`
+
+   Don't re-raise points other reviewers already made. If an earlier comment
+   looks unaddressed in the current code, you may reference it instead.
+
+6. **Check CI (if there is a PR):** `gh pr checks <n>`. For failing checks
+   relevant to the change, look at `gh run view <id> --log-failed` and factor the
+   failure into your review.
+
+7. **Get the scope:** `git diff --stat <merge-base>...HEAD`. Then read the diff
+   per file. Skip lockfiles, generated code, vendored files, snapshots and
+   minified assets (mention that you skipped them).
+
+8. For every changed file, read the FULL file, not just the diff hunk.
+
+9. Read related tests for the changed code.
+
+10. Check project conventions: linter/formatter config, CONTRIBUTING.md, ADRs,
+    style docs, README sections for the touched area.
+
+11. For each non-trivial change, use rg to find 1-2 *similar* existing
+    implementations elsewhere in the codebase. Use these as the baseline for
+    consistency comments. Don't invent conventions; find real precedent and cite
+    the file path.
+
+12. For large diffs, review the highest-risk files first (core logic, public APIs,
+    auth, data access) and state clearly if you didn't cover everything.
 
 ## Step 2 — Review dimensions (in priority order)
 
@@ -65,10 +152,12 @@ Arguments: `$ARGUMENTS`
 - Logic bugs, off-by-one errors, boundary conditions.
 - Edge cases: empty input, null/undefined, concurrency, large input.
 - Failure paths handled the way the rest of the codebase handles them.
+- Does the change actually do what the PR description / linked issue says?
 
 ### D. Tests
 - New logic and its edge cases covered? Follow existing test patterns?
 - Regression test present if this is a bugfix?
+- Does CI pass? If not, is the failure caused by this change?
 
 ### E. Performance & security
 - New N+1 queries, unbounded loops, unindexed lookups, memory growth.
@@ -90,6 +179,7 @@ Arguments: `$ARGUMENTS`
   confident, either drop it or turn it into a `question`. Never present a guess as a fact.
 - Don't repeat yourself: if the same problem occurs in several places, write ONE
   comment on the first occurrence and list the other locations in it.
+- Don't duplicate points already raised in the existing PR discussion.
 - Prefer fewer, higher-signal comments. If you have more than ~10, keep the most
   valuable ones and list the rest as one-liners under "Lower-priority notes".
 
@@ -129,13 +219,17 @@ Do not use severity words like "major/minor/blocker" anywhere.
 Open with:
 
 ## Review of `<branch>` against `<base>`
+- **PR:** #N "title" (url), or "no PR found, local-only review"
 - **Assumed intent:** ...
+- **Sync status:** local HEAD matches PR head / differs (explain)
 - **Coverage:** files reviewed in depth / skipped (and why)
-- **Checks run:** tests/lint you ran and results, or "none"
+- **Checks run:** local tests/lint you ran and results, CI status from `gh pr checks`, or "none"
+- **Existing discussion:** short note on what other reviewers already raised, or "none"
 
 Then list comments ordered by priority: all `(blocking)` first, then
 `(non-blocking)`, then `(if-minor)`, then `praise`/`thought`. Tag each with its
-dimension (A–G) instead of grouping by dimension. Number them (#1, #2, ...) so I can refer to them.
+dimension (A–G) instead of grouping by dimension. Number them (#1, #2, ...) so I
+can refer to them.
 
 Each comment has TWO parts:
 
@@ -173,7 +267,7 @@ file). Then the comment itself, written as a GitHub PR comment with these rules:
 
 Example of the expected tone:
 
-````markdown
+`````markdown
 src/api/users.ts:42
 **suggestion (non-blocking):** I think we could drop the manual retry loop here and use `withRetry` from `src/lib/http.ts`, which `orders.ts` already uses for the same thing. It would also give us the backoff for free. Something like:
 
@@ -182,7 +276,7 @@ const user = await withRetry(() => fetchUser(id));
 ```
 
 Happy to be wrong if there's a reason this one needs custom handling!
-````
+`````
 
 For `praise`, keep it specific and genuine (what was good and why it helps).
 For `question`, ask one clear question and say why you're asking.
@@ -205,3 +299,6 @@ as above. Don't list every comment again.
 
 If something is ambiguous (e.g. you can't tell if a deviation from existing
 patterns is intentional), use a `question` comment instead of guessing.
+````
+
+---
